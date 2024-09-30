@@ -1,11 +1,13 @@
 import os
 import time
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import numpy as np
 import pytorch_lightning as pl
 import wandb
+from tqdm.auto import tqdm
 
 from models.transformer_model import GraphTransformer
 from diffusion.noise_schedule import PredefinedNoiseSchedule
@@ -13,6 +15,7 @@ from src.diffusion import diffusion_utils
 from metrics.train_metrics import TrainLoss
 from metrics.abstract_metrics import SumExceptBatchMetric, SumExceptBatchMSE, NLL
 from src import utils
+from src.utils import PlaceHolder
 
 
 class LiftedDenoisingDiffusion(pl.LightningModule):
@@ -33,6 +36,14 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
         self.name = cfg.general.name
         self.model_dtype = torch.float32
         self.T = cfg.model.diffusion_steps
+        if "gibbs" in cfg.model:
+            self.gibbs = cfg.model.gibbs
+        if "gibbs_N" in cfg.model:
+            self.gibbs_N = cfg.model.gibbs_N
+        if "gibbs_M" in cfg.model:
+            self.gibbs_M = cfg.model.gibbs_M
+        if "gibbs_fixed_t" in cfg.model:
+            self.gibbs_fixed_t = cfg.model.gibbs_fixed_t
 
         self.Xdim = input_dims['X']
         self.Edim = input_dims['E']
@@ -131,9 +142,9 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
     def on_train_epoch_end(self) -> None:
         to_log = self.train_loss.log_epoch_metrics()
         self.print(f"Epoch {self.current_epoch}: X_mse: {to_log['train_epoch/epoch_X_mse'] :.3f}"
-                      f" -- E mse: {to_log['train_epoch/epoch_E_mse'] :.3f} --"
-                      f" y_mse: {to_log['train_epoch/epoch_y_mse'] :.3f}"
-                      f" -- {time.time() - self.start_epoch_time:.1f}s ")
+                   f" -- E mse: {to_log['train_epoch/epoch_E_mse'] :.3f} --"
+                   f" y_mse: {to_log['train_epoch/epoch_y_mse'] :.3f}"
+                   f" -- {time.time() - self.start_epoch_time:.1f}s ")
         epoch_at_metrics, epoch_bond_metrics = self.train_metrics.log_epoch_metrics()
         self.print(f"Epoch {self.current_epoch}: {epoch_at_metrics} -- {epoch_bond_metrics}")
 
@@ -215,7 +226,8 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
                 samples_left_to_generate -= to_generate
                 chains_left_to_save -= chains_save
 
-            self.sampling_metrics(samples, self.name, self.current_epoch, val_counter=-1, test=False)
+            self.sampling_metrics(samples, self.name, self.current_epoch, val_counter=-1, test=False,
+                                  local_rank=self.local_rank)
             print(f'Sampling took {time.time() - start:.2f} seconds\n')
             self.sampling_metrics.reset()
 
@@ -248,13 +260,13 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
         metrics = [self.test_nll.compute(), self.test_X_mse.compute(), self.test_E_mse.compute(),
                    self.test_y_mse.compute(), self.test_X_logp.compute(), self.test_E_logp.compute(),
                    self.test_y_logp.compute()]
-        log_dict={"test/epoch_NLL": metrics[0],
-         "test/X_mse": metrics[1],
-         "test/E_mse": metrics[2],
-         "test/y_mse": metrics[3],
-         "test/X_logp": metrics[4],
-         "test/E_logp": metrics[5],
-         "test/y_logp": metrics[6]}
+        log_dict = {"test/epoch_NLL": metrics[0],
+                    "test/X_mse": metrics[1],
+                    "test/E_mse": metrics[2],
+                    "test/y_mse": metrics[3],
+                    "test/X_logp": metrics[4],
+                    "test/E_logp": metrics[5],
+                    "test/y_logp": metrics[6]}
         if wandb.run:
             wandb.log(log_dict, commit=False)
 
@@ -280,16 +292,24 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
             bs = 2 * self.cfg.train.batch_size
             to_generate = min(samples_left_to_generate, bs)
             to_save = min(samples_left_to_save, bs)
-            chains_save = min(chains_left_to_save, bs)
-            samples.extend(self.sample_batch(id, to_generate, num_nodes=None, save_final=to_save,
-                                             keep_chain=chains_save, number_chain_steps=self.number_chain_steps))
+
+            if self.gibbs:
+                new_samples = self.sample_batch_gibbs(id, to_generate, self.gibbs_N, self.gibbs_M, start=None,
+                                                      num_nodes=None, save_final=to_save)
+            else:
+                chains_save = min(chains_left_to_save, bs)
+                new_samples = self.sample_batch(id, to_generate, num_nodes=None, save_final=to_save,
+                                                keep_chain=chains_save, number_chain_steps=self.number_chain_steps)
+                chains_left_to_save -= chains_save
+
+            samples.extend(new_samples)
             id += to_generate
             samples_left_to_save -= to_save
             samples_left_to_generate -= to_generate
-            chains_left_to_save -= chains_save
 
         self.sampling_metrics.reset()
-        self.sampling_metrics(samples, self.name, self.current_epoch, self.val_counter, test=True)
+        self.sampling_metrics(samples, self.name, self.current_epoch, self.val_counter, test=True,
+                              local_rank=self.local_rank)
         self.sampling_metrics.reset()
 
     def kl_prior(self, X, E, y, node_mask):
@@ -418,12 +438,12 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
         t_normalized = t_int / self.T
 
         # Compute gamma_s and gamma_t via the network.
-        gamma_s = diffusion_utils.inflate_batch_array(self.gamma(s_normalized), X.size())    # (bs, 1, 1),
-        gamma_t = diffusion_utils.inflate_batch_array(self.gamma(t_normalized), X.size())    # (bs, 1, 1)
+        gamma_s = diffusion_utils.inflate_batch_array(self.gamma(s_normalized), X.size())  # (bs, 1, 1),
+        gamma_t = diffusion_utils.inflate_batch_array(self.gamma(t_normalized), X.size())  # (bs, 1, 1)
 
         # Compute alpha_t and sigma_t from gamma, with correct size for X, E and z
-        alpha_t = diffusion_utils.alpha(gamma_t, X.size())                        # (bs, 1, ..., 1), same n_dims than X
-        sigma_t = diffusion_utils.sigma(gamma_t, X.size())                        # (bs, 1, ..., 1), same n_dims than X
+        alpha_t = diffusion_utils.alpha(gamma_t, X.size())  # (bs, 1, ..., 1), same n_dims than X
+        sigma_t = diffusion_utils.sigma(gamma_t, X.size())  # (bs, 1, ..., 1), same n_dims than X
 
         # Sample zt ~ Normal(alpha_t x, sigma_t)
         eps = diffusion_utils.sample_feature_noise(X.size(), E.size(), y.size(), node_mask).type_as(X)
@@ -446,9 +466,9 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
                X, E, y : (bs, n, dx),  (bs, n, n, de), (bs, dy)
                node_mask : (bs, n)
            Output: nll (size 1). """
-           
+
         s = noisy_data['s']
-        gamma_s = noisy_data['gamma_s']     # gamma_s.size() == X.size()
+        gamma_s = noisy_data['gamma_s']  # gamma_s.size() == X.size()
         gamma_t = noisy_data['gamma_t']
         epsX = noisy_data['epsX']
         epsE = noisy_data['epsE']
@@ -466,14 +486,14 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
 
         delta_log_py = -self.ydim_output * np.log(self.norm_values[2])
         delta_log_px = -self.Xdim_output * N * np.log(self.norm_values[0])
-        delta_log_pE = -self.Edim_output * 0.5 * N * (N-1) * np.log(self.norm_values[1])
+        delta_log_pE = -self.Edim_output * 0.5 * N * (N - 1) * np.log(self.norm_values[1])
         kl_prior = kl_prior_without_prefactor - delta_log_px - delta_log_py - delta_log_pE
 
         # 3. Diffusion loss
 
         # Compute weighting with SNR: (1 - SNR(s-t)) for epsilon parametrization.
         SNR_weight = - (1 - diffusion_utils.SNR(gamma_s - gamma_t))
-        sqrt_SNR_weight = torch.sqrt(SNR_weight)            # same n_dims than X
+        sqrt_SNR_weight = torch.sqrt(SNR_weight)  # same n_dims than X
         # Compute the error.
         weighted_predX_diffusion = sqrt_SNR_weight * pred.X
         weighted_epsX_diffusion = sqrt_SNR_weight * epsX
@@ -493,14 +513,14 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
             diffusion_error = (self.val_X_mse(weighted_predX_diffusion, weighted_epsX_diffusion) +
                                self.val_E_mse(weighted_predE_diffusion, weighted_epsE_diffusion) +
                                self.val_y_mse(weighted_predy_diffusion, weighted_epsy_diffusion))
-        loss_all_t = 0.5 * self.T * diffusion_error           # t=0 is not included here.
+        loss_all_t = 0.5 * self.T * diffusion_error  # t=0 is not included here.
 
         # 4. Compute L0 term : -log p (X, E, y | z_0) = reconstruction loss
         # Compute noise values for t = 0.
-        t_zeros = torch.zeros_like(s)                                                       # bs, 1
-        gamma_0 = diffusion_utils.inflate_batch_array(self.gamma(t_zeros), X_t.size())      # bs, 1, 1
-        alpha_0 = diffusion_utils.alpha(gamma_0, X_t.size())                                # bs, 1, 1
-        sigma_0 = diffusion_utils.sigma(gamma_0, X_t.size())                                # bs, 1, 1
+        t_zeros = torch.zeros_like(s)  # bs, 1
+        gamma_0 = diffusion_utils.inflate_batch_array(self.gamma(t_zeros), X_t.size())  # bs, 1, 1
+        alpha_0 = diffusion_utils.alpha(gamma_0, X_t.size())  # bs, 1, 1
+        sigma_0 = diffusion_utils.sigma(gamma_0, X_t.size())  # bs, 1, 1
 
         # Sample z_0 given X, E, y for timestep t, from q(z_t | X, E, y)
         eps0 = diffusion_utils.sample_feature_noise(X_t.size(), E_t.size(), y_t.size(), node_mask).type_as(X_t)
@@ -561,7 +581,7 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
 
     @torch.no_grad()
     def sample_batch(self, batch_id: int, batch_size: int, keep_chain: int, save_final: int, number_chain_steps: int,
-                      num_nodes=None):
+                     num_nodes=None):
         """
         :param batch_id: int
         :param batch_size: int
@@ -664,7 +684,7 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
         if self.visualization_tools is not None:
             print('Visualizing chains...')
             current_path = os.getcwd()
-            num_molecules = chain_X.size(1)       # number of molecules
+            num_molecules = chain_X.size(1)  # number of molecules
             for i in range(num_molecules):
                 result_path = os.path.join(current_path, f'chains/{self.cfg.general.name}/'
                                                          f'epoch{self.current_epoch}/'
@@ -674,8 +694,117 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
                     _ = self.visualization_tools.visualize_chain(result_path,
                                                                  chain_X[:, i, :].numpy(),
                                                                  chain_E[:, i, :].numpy())
-                print('\r{}/{} complete'.format(i+1, num_molecules), end='', flush=True)
+                print('\r{}/{} complete'.format(i + 1, num_molecules), end='', flush=True)
 
+            # Visualize the final molecules
+            print("Visualizing molecules...")
+            current_path = os.getcwd()
+            result_path = os.path.join(current_path,
+                                       f'graphs/{self.name}/epoch{self.current_epoch}_b{batch_id}/')
+            self.visualization_tools.visualize(result_path, molecule_list, save_final, log='graph')
+            print("Done.")
+
+        return molecule_list
+
+    @torch.no_grad()
+    def sample_batch_gibbs(self, batch_id: int, batch_size: int, N: int, M: int, start: Optional[PlaceHolder],
+                           save_final: int, num_nodes=None):
+        """
+        :param batch_id: int
+        :param batch_size: int
+        :param num_nodes: int, <int>tensor (batch_size) (optional) for specifying number of nodes
+        :param save_final: int: number of predictions to save to file
+        :param keep_chain: int: number of chains to save to file
+        :param number_chain_steps: number of timesteps to save for each chain
+        :return: molecule_list. Each element of this list is a tuple (atom_types, charges, positions)
+        """
+        if num_nodes is None:
+            n_nodes = self.node_dist.sample_n(batch_size, self.device)
+        elif type(num_nodes) == int:
+            n_nodes = num_nodes * torch.ones(batch_size, device=self.device, dtype=torch.int)
+        else:
+            assert isinstance(num_nodes, torch.Tensor)
+            n_nodes = num_nodes
+        n_nodes_max = torch.max(n_nodes).item()
+
+        # Build the masks
+        arange = torch.arange(n_nodes_max, device=self.device).unsqueeze(0).expand(batch_size, -1)
+        node_mask = arange < n_nodes.unsqueeze(1)
+        node_mask = node_mask.float()
+
+        if start is None:
+            # Sample noise  -- z has size (n_samples, n_nodes, n_features)
+            z_T = [diffusion_utils.sample_feature_noise(X_size=(batch_size, n_nodes_max, self.Xdim_output),
+                                                        E_size=(batch_size, n_nodes_max, n_nodes_max, self.Edim_output),
+                                                        y_size=(batch_size, self.ydim_output),
+                                                        node_mask=node_mask) for _ in range(M)]
+            X = torch.stack([z_T_k.X for z_T_k in z_T], dim=1)
+            E = torch.stack([z_T_k.E for z_T_k in z_T], dim=1)
+            y = torch.stack([z_T_k.y for z_T_k in z_T], dim=1)
+            start = PlaceHolder(X=X[0, 0], E=E[0, 0], y=y[0, 0])
+        else:
+            X = start.X.unsqueeze(0).expand(batch_size * M, -1, -1)
+            E = start.E.unsqueeze(0).expand(batch_size * M, -1, -1, -1)
+            y = start.y.unsqueeze(0).expand(batch_size * M, -1)
+            noisy_data = self.apply_noise(X, E, y, node_mask)
+            X, E, y, node_mask = noisy_data["X_t"], noisy_data["E_t"], noisy_data["y_t"], noisy_data["node_mask"]
+            X = X.view(batch_size, M, n_nodes_max, self.Xdim_output)
+            E = E.view(batch_size, M, n_nodes_max, n_nodes_max, self.Edim_output)
+            y = y.view(batch_size, M, self.ydim_output)
+
+        assert (E == torch.transpose(E, 2, 3)).all()
+
+        denoised_X_lst = [start.X.unsqueeze(0).expand(batch_size, -1, -1), ]
+        denoised_E_lst = [start.E.unsqueeze(0).expand(batch_size, -1, -1, -1), ]
+        denoised_y_lst = [start.y.unsqueeze(0).expand(batch_size, -1), ]
+        # previous_X = start.X.unsqueeze(0).expand(batch_size, -1, -1)
+        # previous_E = start.E.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        # previous_y = start.y.unsqueeze(0).expand(batch_size, -1)
+        # previous = PlaceHolder(previous_X, previous_E, previous_y)
+
+        for i in range(N):
+            for k in tqdm(range(M)):
+                averaged_X = torch.mean(X, dim=1)
+                averaged_E = torch.mean(E, dim=1)
+                averaged_y = torch.mean(y.float(), dim=1)
+                fixed_s_norm = torch.zeros((batch_size, 1)).type_as(y)
+                fixed_t_norm = self.gibbs_fixed_t * torch.ones((batch_size, 1)).type_as(y)
+                denoised = self.sample_p_zs_given_zt(s=fixed_s_norm, t=fixed_t_norm,
+                                                     X_t=averaged_X, E_t=averaged_E, y_t=averaged_y,
+                                                     node_mask=node_mask)
+                # denoised.X = 2 * denoised.X - previous.X
+                # denoised.E = 2 * denoised.E - previous.E
+                # denoised.y = 2 * denoised.y - previous.y
+                # previous = denoised
+
+                noisy_data = self.apply_noise(denoised.X, denoised.E, denoised.y, node_mask)
+                X[:, k], E[:, k], y[:, k] = noisy_data["X_t"], noisy_data["E_t"], noisy_data["y_t"]
+
+                if k % max(M // 10, 1) == 0:
+                    tqdm.write(f'[{i}/{N}]: {k}/{M}')
+                    sampled_0 = self.sample_p_zs_given_zt(s=fixed_s_norm, t=fixed_t_norm,
+                                                          X_t=denoised.X, E_t=denoised.E, y_t=denoised.y,
+                                                          node_mask=node_mask)
+                    denoised_X, denoised_E, denoised_y = sampled_0.X, sampled_0.E, sampled_0.y
+                    denoised_X_lst.append(denoised_X)
+                    denoised_E_lst.append(denoised_E)
+                    denoised_y_lst.append(denoised_y)
+        X, E, y = denoised_X_lst[-1], denoised_E_lst[-1], denoised_y_lst[-1]
+
+        # Finally sample the discrete data given the last latent code z0
+        final_graph = self.sample_discrete_graph_given_z0(X, E, y, node_mask)
+        X, E, y = final_graph.X, final_graph.E, final_graph.y
+        assert (E == torch.transpose(E, 1, 2)).all()
+
+        # Split the generated molecules
+        molecule_list = []
+        for i in range(batch_size):
+            n = n_nodes[i]
+            atom_types = X[i, :n].cpu()
+            edge_types = E[i, :n, :n].cpu()
+            molecule_list.append([atom_types, edge_types])
+
+        if self.visualization_tools is not None:
             # Visualize the final molecules
             print("Visualizing molecules...")
             current_path = os.getcwd()
@@ -732,14 +861,15 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
 
         # Compute mu for p(zs | zt).
         mu_X = X_t / alpha_t_given_s - (sigma2_t_given_s / (alpha_t_given_s * sigma_t)) * eps.X
-        mu_E = E_t / alpha_t_given_s.unsqueeze(1) - (sigma2_t_given_s / (alpha_t_given_s * sigma_t)).unsqueeze(1) * eps.E
+        mu_E = E_t / alpha_t_given_s.unsqueeze(1) - (sigma2_t_given_s / (alpha_t_given_s * sigma_t)).unsqueeze(
+            1) * eps.E
         mu_y = y_t / alpha_t_given_s.squeeze(1) - (sigma2_t_given_s / (alpha_t_given_s * sigma_t)).squeeze(1) * eps.y
 
         # Compute sigma for p(zs | zt).
         sigma = sigma_t_given_s * sigma_s / sigma_t
 
         # Sample zs given the parameters derived from zt.
-        z_s = diffusion_utils.sample_normal(mu_X, mu_E,  mu_y, sigma, node_mask).type_as(mu_X)
+        z_s = diffusion_utils.sample_normal(mu_X, mu_E, mu_y, sigma, node_mask).type_as(mu_X)
 
         return z_s
 
