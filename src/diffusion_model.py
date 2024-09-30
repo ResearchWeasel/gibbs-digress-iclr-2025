@@ -680,8 +680,8 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
             edge_types = E[i, :n, :n].cpu()
             molecule_list.append([atom_types, edge_types])
 
-        # Visualize chains
         if self.visualization_tools is not None:
+            # Visualize chains
             print('Visualizing chains...')
             current_path = os.getcwd()
             num_molecules = chain_X.size(1)  # number of molecules
@@ -712,10 +712,11 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
         """
         :param batch_id: int
         :param batch_size: int
+        :param N: int: Gibbs sampling iterations
+        :param M: int: Gibbs ensemble size
+        :param start: initial graph from which to generate Gibbs ensemble, optional
         :param num_nodes: int, <int>tensor (batch_size) (optional) for specifying number of nodes
         :param save_final: int: number of predictions to save to file
-        :param keep_chain: int: number of chains to save to file
-        :param number_chain_steps: number of timesteps to save for each chain
         :return: molecule_list. Each element of this list is a tuple (atom_types, charges, positions)
         """
         if num_nodes is None:
@@ -789,9 +790,23 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
                     denoised_X_lst.append(denoised_X)
                     denoised_E_lst.append(denoised_E)
                     denoised_y_lst.append(denoised_y)
-        X, E, y = denoised_X_lst[-1], denoised_E_lst[-1], denoised_y_lst[-1]
+
+        # Prepare the chain for saving
+        chain_X, chain_E = [], []
+        for denoised_X, denoised_E, denoised_y in zip(denoised_X_lst, denoised_E_lst, denoised_y_lst):
+            unnormalized = utils.unnormalize(X=denoised_X[:save_final],
+                                             E=denoised_E[:save_final],
+                                             y=denoised_y[:save_final],
+                                             norm_values=self.norm_values,
+                                             norm_biases=self.norm_biases,
+                                             node_mask=node_mask[:save_final],
+                                             collapse=True)
+            chain_X.append(unnormalized.X)
+            chain_E.append(unnormalized.E)
+        chain_X, chain_E = torch.stack(chain_X).cpu(), torch.stack(chain_E).cpu()
 
         # Finally sample the discrete data given the last latent code z0
+        X, E, y = denoised_X_lst[-1], denoised_E_lst[-1], denoised_y_lst[-1]
         final_graph = self.sample_discrete_graph_given_z0(X, E, y, node_mask)
         X, E, y = final_graph.X, final_graph.E, final_graph.y
         assert (E == torch.transpose(E, 1, 2)).all()
@@ -805,6 +820,21 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
             molecule_list.append([atom_types, edge_types])
 
         if self.visualization_tools is not None:
+            # Visualize chains
+            print('Visualizing chains...')
+            current_path = os.getcwd()
+            num_molecules = chain_X.size(1)  # number of molecules
+            for i in range(num_molecules):
+                result_path = os.path.join(current_path, f'chains/{self.cfg.general.name}/'
+                                                         f'epoch{self.current_epoch}/'
+                                                         f'chains/molecule_{batch_id + i}')
+                if not os.path.exists(result_path):
+                    os.makedirs(result_path)
+                    _ = self.visualization_tools.visualize_chain(result_path,
+                                                                 chain_X[:, i, :].numpy(),
+                                                                 chain_E[:, i, :].numpy())
+                print('\r{}/{} complete'.format(i + 1, num_molecules), end='', flush=True)
+
             # Visualize the final molecules
             print("Visualizing molecules...")
             current_path = os.getcwd()
