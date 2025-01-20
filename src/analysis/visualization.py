@@ -12,9 +12,6 @@ import wandb
 import matplotlib.pyplot as plt
 
 
-
-
-
 class MolecularVisualization:
     def __init__(self, remove_h, dataset_infos):
         self.remove_h = remove_h
@@ -75,7 +72,7 @@ class MolecularVisualization:
         if num_molecules_to_visualize > len(molecules):
             print(f"Shortening to {len(molecules)}")
             num_molecules_to_visualize = len(molecules)
-        
+
         for i in range(num_molecules_to_visualize):
             file_path = os.path.join(path, 'molecule_{}.png'.format(i))
             mol = self.mol_from_graphs(molecules[i][0].numpy(), molecules[i][1].numpy())
@@ -87,24 +84,18 @@ class MolecularVisualization:
             except rdkit.Chem.KekulizeException:
                 print("Can't kekulize molecule")
 
-
     def visualize_chain(self, path, nodes_list, adjacency_matrix, trainer=None):
         RDLogger.DisableLog('rdApp.*')
         # convert graphs to the rdkit molecules
         mols = [self.mol_from_graphs(nodes_list[i], adjacency_matrix[i]) for i in range(nodes_list.shape[0])]
 
-        # find the coordinates of atoms in the final molecule
-        final_molecule = mols[-1]
-        AllChem.Compute2DCoords(final_molecule)
-
-        coords = []
-        for i, atom in enumerate(final_molecule.GetAtoms()):
-            positions = final_molecule.GetConformer().GetAtomPosition(i)
-            coords.append((positions.x, positions.y, positions.z))
-
         # align all the molecules
         for i, mol in enumerate(mols):
             AllChem.Compute2DCoords(mol)
+            coords = []
+            for j, atom in enumerate(mol.GetAtoms()):
+                positions = mol.GetConformer().GetAtomPosition(j)
+                coords.append((positions.x, positions.y, positions.z))
             conf = mol.GetConformer()
             for j, atom in enumerate(mol.GetAtoms()):
                 x, y, z = coords[j]
@@ -130,7 +121,7 @@ class MolecularVisualization:
 
         # draw grid image
         try:
-            img = Draw.MolsToGridImage(mols, molsPerRow=10, subImgSize=(200, 200))
+            img = Draw.MolsToGridImage(mols, molsPerRow=20, subImgSize=(200, 200))
             img.save(os.path.join(path, '{}_grid_image.png'.format(path.split('/')[-1])))
         except Chem.rdchem.KekulizeException:
             print("Can't kekulize molecule")
