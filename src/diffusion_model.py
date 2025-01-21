@@ -236,10 +236,10 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
                 samples_left_to_generate -= to_generate
                 chains_left_to_save -= chains_save
 
-            self.sampling_metrics(samples, self.name, self.current_epoch, val_counter=-1, test=False,
-                                  local_rank=self.local_rank)
-            print(f'Sampling took {time.time() - start:.2f} seconds\n')
-            self.sampling_metrics.reset()
+            # self.sampling_metrics(samples, self.name, self.current_epoch, val_counter=-1, test=False,
+            #                       local_rank=self.local_rank)
+            # print(f'Sampling took {time.time() - start:.2f} seconds\n')
+            # self.sampling_metrics.reset()
 
     def on_test_epoch_start(self) -> None:
         self.test_nll.reset()
@@ -786,7 +786,7 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
 
                 denoised = self.sample_p_zs_given_zt(s=fixed_s_norm, t=fixed_t_norm,
                                                      X_t=averaged_X, E_t=averaged_E, y_t=averaged_y,
-                                                     node_mask=node_mask, gibbs=True)
+                                                     node_mask=node_mask)
 
                 noisy_data = self.apply_noise(denoised.X, denoised.E, denoised.y, node_mask, gibbs=True)
                 X[:, k], E[:, k], y[:, k] = noisy_data["X_t"], noisy_data["E_t"], noisy_data["y_t"]
@@ -799,7 +799,7 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
                         sampled_0 = self.sample_p_zs_given_zt(s=fixed_s_norm - ((j + 1) / self.T),
                                                               t=fixed_t_norm - (j / self.T),
                                                               X_t=denoised_X, E_t=denoised_E, y_t=denoised_y,
-                                                              node_mask=node_mask, gibbs=True)
+                                                              node_mask=node_mask)
                         denoised_X, denoised_E, denoised_y = sampled_0.X, sampled_0.E, sampled_0.y
                     denoised_X_lst.append(denoised_X)
                     denoised_E_lst.append(denoised_E)
