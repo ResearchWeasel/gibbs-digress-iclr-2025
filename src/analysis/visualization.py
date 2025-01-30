@@ -192,8 +192,6 @@ class NonMolecularVisualization:
         # convert graphs to networkx
         graphs = [self.to_networkx(nodes_list[i], adjacency_matrix[i]) for i in range(nodes_list.shape[0])]
         # find the coordinates of atoms in the final molecule
-        final_graph = graphs[-1]
-        final_pos = nx.spring_layout(final_graph, seed=0)
 
         # draw gif
         save_paths = []
@@ -201,10 +199,23 @@ class NonMolecularVisualization:
 
         for frame in range(num_frams):
             file_name = os.path.join(path, 'fram_{}.png'.format(frame))
-            self.visualize_non_molecule(graph=graphs[frame], pos=final_pos, path=file_name)
+            graph = graphs[frame]
+            pos = nx.spring_layout(graph, seed=0)
+            self.visualize_non_molecule(graph=graph, pos=pos, path=file_name)
             save_paths.append(file_name)
 
         imgs = [imageio.imread(fn) for fn in save_paths]
+        img_height, img_width, _ = imgs[-1].shape
+        n_imgs = len(imgs)
+        img_grid_width = 20 * img_width
+        img_grid_height = int(np.ceil(n_imgs / 20)) * img_height
+        img_grid = np.zeros((img_grid_height, img_grid_width, 4), dtype=np.uint8)
+        for i in range(n_imgs):
+            row, col = i // 20, i % 20
+            img_grid[row * img_height:(row + 1) * img_height, col * img_width:(col + 1) * img_width] = imgs[i]
+        img_grid_path = os.path.join(os.path.dirname(path), '{}_grid_image.png'.format(path.split('/')[-1]))
+        imageio.imsave(img_grid_path, img_grid)
+
         gif_path = os.path.join(os.path.dirname(path), '{}.gif'.format(path.split('/')[-1]))
         imgs.extend([imgs[-1]] * 10)
         imageio.mimsave(gif_path, imgs, subrectangles=True, duration=20)

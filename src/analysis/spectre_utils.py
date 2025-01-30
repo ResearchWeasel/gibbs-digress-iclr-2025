@@ -437,7 +437,6 @@ def motif_stats(graph_ref_list, graph_pred_list, motif_type='4cycle', ground_tru
     total_counts_ref = np.array(total_counts_ref)[:, None]
     total_counts_pred = np.array(total_counts_pred)[:, None]
 
-
     if compute_emd:
         # EMD option uses the same computation as GraphRNN, the alternative is MMD as computed by GRAN
         # mmd_dist = compute_mmd(total_counts_ref, total_counts_pred, kernel=emd, is_hist=False)
@@ -772,11 +771,13 @@ class SpectreSamplingMetrics(nn.Module):
 
         np.savez('generated_adjs.npz', *adjacency_matrices)
 
+        to_log = {}
         if 'degree' in self.metrics_list:
             if local_rank == 0:
                 print("Computing degree stats..")
             degree = degree_stats(reference_graphs, networkx_graphs, is_parallel=True,
                                   compute_emd=self.compute_emd)
+            to_log['degree'] = degree
             if wandb.run:
                 wandb.run.summary['degree'] = degree
 
@@ -786,7 +787,6 @@ class SpectreSamplingMetrics(nn.Module):
         # eigval_stats(eig_ref_list, eig_pred_list, max_eig=20, is_parallel=True, compute_emd=False)
         # spectral_filter_stats(eigvec_ref_list, eigval_ref_list, eigvec_pred_list, eigval_pred_list, is_parallel=False,
         #                       compute_emd=False)          # This is the one called wavelet
-        to_log = {}
 
         if 'spectre' in self.metrics_list:
             if local_rank == 0:
@@ -796,7 +796,7 @@ class SpectreSamplingMetrics(nn.Module):
 
             to_log['spectre'] = spectre
             if wandb.run:
-              wandb.run.summary['spectre'] = spectre
+                wandb.run.summary['spectre'] = spectre
 
         if 'clustering' in self.metrics_list:
             if local_rank == 0:
@@ -863,8 +863,8 @@ class SpectreSamplingMetrics(nn.Module):
 class Comm20SamplingMetrics(SpectreSamplingMetrics):
     def __init__(self, datamodule):
         super().__init__(datamodule=datamodule,
-                         compute_emd=True,
-                         metrics_list=['degree', 'clustering', 'orbit'])
+                         compute_emd=False,
+                         metrics_list=['degree', 'clustering', 'orbit', 'spectre'])
 
 
 class PlanarSamplingMetrics(SpectreSamplingMetrics):
