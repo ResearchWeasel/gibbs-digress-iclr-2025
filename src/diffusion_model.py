@@ -2,19 +2,19 @@ import os
 import time
 from typing import Optional
 
-import torch
-import torch.nn as nn
 import numpy as np
 import pytorch_lightning as pl
+import torch
+import torch.nn as nn
 import wandb
 from tqdm.auto import tqdm
 
-from models.transformer_model import GraphTransformer
 from diffusion.noise_schedule import PredefinedNoiseSchedule
-from src.diffusion import diffusion_utils
+from metrics.abstract_metrics import NLL, SumExceptBatchMetric, SumExceptBatchMSE
 from metrics.train_metrics import TrainLoss
-from metrics.abstract_metrics import SumExceptBatchMetric, SumExceptBatchMSE, NLL
+from models.transformer_model import GraphTransformer
 from src import utils
+from src.diffusion import diffusion_utils
 from src.utils import PlaceHolder
 
 
@@ -812,26 +812,29 @@ class LiftedDenoisingDiffusion(pl.LightningModule):
                     denoised_E_lst.append(denoised_E)
                     denoised_y_lst.append(denoised_y)
 
-
         # Denoise chain from t_2 to t_1
         chain_length = len(denoised_X_lst)
         node_mask_lst = node_mask.unsqueeze(0).expand(chain_length, -1, -1).reshape(-1, n_nodes_max)
         denoised_X_lst = torch.stack(denoised_X_lst).view(-1, n_nodes_max, self.Xdim_output)
         denoised_E_lst = torch.stack(denoised_E_lst).view(-1, n_nodes_max, n_nodes_max, self.Edim_output)
-        denoised_y_lst = torch.stack(denoised_y_lst).view(chain_length*batch_size, self.ydim_output)
+        denoised_y_lst = torch.stack(denoised_y_lst).view(chain_length * batch_size, self.ydim_output)
         bs = 2 * self.cfg.train.batch_size
         P = int((self.gibbs_fixed_t_2 - self.gibbs_fixed_t_1) * self.T) + 1
-        for b in range(0, chain_length*batch_size, bs):
-            denoised_X, denoised_E, denoised_y = denoised_X_lst[b:b+bs], denoised_E_lst[b:b+bs], denoised_y_lst[b:b+bs]
+        for b in range(0, chain_length * batch_size, bs):
+            denoised_X = denoised_X_lst[b:b + bs]
+            denoised_E = denoised_E_lst[b:b + bs]
+            denoised_y = denoised_y_lst[b:b + bs]
             fixed_t_norm = self.gibbs_fixed_t_2 * torch.ones((min(bs, denoised_X.size(0)), 1)).type_as(node_mask)
             fixed_s_norm = fixed_t_norm - (1 / self.T)
             for j in tqdm(range(P), "Refining chain batch"):
                 sampled_0 = self.sample_p_zs_given_zt(s=fixed_s_norm - (j / self.T),
                                                       t=fixed_t_norm - (j / self.T),
                                                       X_t=denoised_X, E_t=denoised_E, y_t=denoised_y,
-                                                      node_mask=node_mask_lst[b:b+bs])
+                                                      node_mask=node_mask_lst[b:b + bs])
                 denoised_X, denoised_E, denoised_y = sampled_0.X, sampled_0.E, sampled_0.y
-            denoised_X_lst[b:b+bs], denoised_E_lst[b:b+bs], denoised_y_lst[b:b+bs] = denoised_X, denoised_E, denoised_y
+            denoised_X_lst[b:b + bs] = denoised_X
+            denoised_E_lst[b:b + bs] = denoised_E
+            denoised_y_lst[b:b + bs] = denoised_y
         denoised_X_lst = denoised_X_lst.view(-1, batch_size, n_nodes_max, self.Xdim_output)
         denoised_E_lst = denoised_E_lst.view(-1, batch_size, n_nodes_max, n_nodes_max, self.Edim_output)
         denoised_y_lst = denoised_y_lst.view(chain_length, batch_size, self.ydim_output)
