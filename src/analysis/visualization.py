@@ -12,9 +12,6 @@ import wandb
 import matplotlib.pyplot as plt
 
 
-
-
-
 class MolecularVisualization:
     def __init__(self, remove_h, dataset_infos):
         self.remove_h = remove_h
@@ -75,7 +72,7 @@ class MolecularVisualization:
         if num_molecules_to_visualize > len(molecules):
             print(f"Shortening to {len(molecules)}")
             num_molecules_to_visualize = len(molecules)
-        
+
         for i in range(num_molecules_to_visualize):
             file_path = os.path.join(path, 'molecule_{}.png'.format(i))
             mol = self.mol_from_graphs(molecules[i][0].numpy(), molecules[i][1].numpy())
@@ -87,24 +84,18 @@ class MolecularVisualization:
             except rdkit.Chem.KekulizeException:
                 print("Can't kekulize molecule")
 
-
     def visualize_chain(self, path, nodes_list, adjacency_matrix, trainer=None):
         RDLogger.DisableLog('rdApp.*')
         # convert graphs to the rdkit molecules
         mols = [self.mol_from_graphs(nodes_list[i], adjacency_matrix[i]) for i in range(nodes_list.shape[0])]
 
-        # find the coordinates of atoms in the final molecule
-        final_molecule = mols[-1]
-        AllChem.Compute2DCoords(final_molecule)
-
-        coords = []
-        for i, atom in enumerate(final_molecule.GetAtoms()):
-            positions = final_molecule.GetConformer().GetAtomPosition(i)
-            coords.append((positions.x, positions.y, positions.z))
-
         # align all the molecules
         for i, mol in enumerate(mols):
             AllChem.Compute2DCoords(mol)
+            coords = []
+            for j, atom in enumerate(mol.GetAtoms()):
+                positions = mol.GetConformer().GetAtomPosition(j)
+                coords.append((positions.x, positions.y, positions.z))
             conf = mol.GetConformer()
             for j, atom in enumerate(mol.GetAtoms()):
                 x, y, z = coords[j]
@@ -130,7 +121,7 @@ class MolecularVisualization:
 
         # draw grid image
         try:
-            img = Draw.MolsToGridImage(mols, molsPerRow=10, subImgSize=(200, 200))
+            img = Draw.MolsToGridImage(mols, molsPerRow=20, subImgSize=(200, 200))
             img.save(os.path.join(path, '{}_grid_image.png'.format(path.split('/')[-1])))
         except Chem.rdchem.KekulizeException:
             print("Can't kekulize molecule")
@@ -201,8 +192,6 @@ class NonMolecularVisualization:
         # convert graphs to networkx
         graphs = [self.to_networkx(nodes_list[i], adjacency_matrix[i]) for i in range(nodes_list.shape[0])]
         # find the coordinates of atoms in the final molecule
-        final_graph = graphs[-1]
-        final_pos = nx.spring_layout(final_graph, seed=0)
 
         # draw gif
         save_paths = []
@@ -210,10 +199,23 @@ class NonMolecularVisualization:
 
         for frame in range(num_frams):
             file_name = os.path.join(path, 'fram_{}.png'.format(frame))
-            self.visualize_non_molecule(graph=graphs[frame], pos=final_pos, path=file_name)
+            graph = graphs[frame]
+            pos = nx.spring_layout(graph, seed=0)
+            self.visualize_non_molecule(graph=graph, pos=pos, path=file_name)
             save_paths.append(file_name)
 
         imgs = [imageio.imread(fn) for fn in save_paths]
+        img_height, img_width, _ = imgs[-1].shape
+        n_imgs = len(imgs)
+        img_grid_width = 20 * img_width
+        img_grid_height = int(np.ceil(n_imgs / 20)) * img_height
+        img_grid = np.zeros((img_grid_height, img_grid_width, 4), dtype=np.uint8)
+        for i in range(n_imgs):
+            row, col = i // 20, i % 20
+            img_grid[row * img_height:(row + 1) * img_height, col * img_width:(col + 1) * img_width] = imgs[i]
+        img_grid_path = os.path.join(os.path.dirname(path), '{}_grid_image.png'.format(path.split('/')[-1]))
+        imageio.imsave(img_grid_path, img_grid)
+
         gif_path = os.path.join(os.path.dirname(path), '{}.gif'.format(path.split('/')[-1]))
         imgs.extend([imgs[-1]] * 10)
         imageio.mimsave(gif_path, imgs, subrectangles=True, duration=20)

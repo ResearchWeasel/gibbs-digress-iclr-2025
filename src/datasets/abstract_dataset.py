@@ -21,7 +21,7 @@ class AbstractDataModule(LightningDataset):
 
     def node_counts(self, max_nodes_possible=300):
         all_counts = torch.zeros(max_nodes_possible)
-        for loader in [self.train_dataloader(), self.val_dataloader()]:
+        for loader in [self.train_dataloader(), self.val_dataloader(), self.test_dataloader()]:
             for data in loader:
                 unique, counts = torch.unique(data.batch, return_counts=True)
                 for count in counts:

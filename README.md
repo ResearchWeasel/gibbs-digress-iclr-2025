@@ -1,6 +1,6 @@
 # Improving Single Noise Level Diffusion Samplers with Restricted Gaussian Oracles
 
-ICLR 2025 conference submission - graph generation experiments
+ICML 2025 conference submission - graph generation experiments
 
 ----------------------
 
@@ -14,7 +14,7 @@ We study sampling from probability distributions using diffusion tempering schem
 
 Clone this repository by running:
 
-`git clone https://github.com/ResearchWeasel/gibbs-digress-iclr-2025.git`
+`git clone https://github.com/ResearchWeasel/gibbs-digress-icml-2025.git`
 
 ### Dependencies
 
