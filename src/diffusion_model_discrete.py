@@ -333,6 +333,20 @@ class DiscreteDenoisingDiffusion(pl.LightningModule):
         self.print("Generated graphs Saved. Computing sampling metrics...")
         self.sampling_metrics(samples, self.name, self.current_epoch, self.val_counter, test=True,
                               local_rank=self.local_rank)
+        self.print("Sampling metrics Computed. Drawing ground truth graphs...")
+        samples_true = []
+        for batch in self.dataset_info.datamodule.test_dataloader():
+            dense_data, node_mask = utils.to_dense(x=batch.x, edge_index=batch.edge_index,
+                                                   edge_attr=batch.edge_attr, batch=batch.batch)
+            dense_data = dense_data.mask(node_mask, collapse=True)
+            X_batch, E_batch = dense_data.X, dense_data.E
+            n_nodes = node_mask.sum(dim=1)
+            for X, E, n in zip(X_batch, E_batch, n_nodes):
+                samples_true.append((X[:n].cpu(), E[:n, :n].cpu()))
+        current_path = os.getcwd()
+        result_path = os.path.join(current_path, f'graphs_true/{self.name}/epoch{self.current_epoch}_b0/')
+        self.visualization_tools.visualize(result_path, samples_true,
+                                           self.cfg.general.final_model_samples_to_save, log='graph_true')
         self.print("Done testing.")
 
     def kl_prior(self, X, E, node_mask):
